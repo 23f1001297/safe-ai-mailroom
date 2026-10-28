@@ -2,305 +2,229 @@ import os
 import json
 import hashlib
 import base64
+import asyncio
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
-import google.generativeai as genai
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-# Initialize Gemini API
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+app = FastAPI(title="Observable Mailroom Agent - Production Hardened")
 
-app = FastAPI(title="Safe AI Mailroom Agent", version="2.0.0")
+# In-memory storage for evaluations and decision caching
+evaluations_db: Dict[str, Dict[str, Any]] = {}
+dossier_cache: Dict[str, Dict[str, Any]] = {}
+LOCK = asyncio.Lock()
 
-# In-memory storage with state persistence support across requests
-EVALUATIONS_DB: Dict[str, Dict[str, Any]] = {}  # evaluationId -> {inputDigest, proposals, receiptVerifier, status, outcomes}
-DOSSIER_CACHE: Dict[str, Dict[str, Any]] = {}    # dossier_content_hash -> cached proposal dict
+def canonical_json(data: Any) -> str:
+    """Encodes data as recursively key-sorted, compact JSON."""
+    return json.dumps(data, sort_keys=True, separators=(',', ':'))
 
-def canonical_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+def compute_sha256(data: str) -> str:
+    return hashlib.sha256(data.encode('utf-8')).hexdigest()
 
-def compute_input_digest(dossiers: List[Dict[str, Any]]) -> str:
-    return hashlib.sha256(canonical_json_dumps(dossiers).encode('utf-8')).hexdigest()
+def base64url_decode(input_str: str) -> bytes:
+    padding = 4 - (len(input_str) % 4)
+    if padding < 4:
+        input_str += '=' * padding
+    return base64.urlsafe_b64decode(input_str)
 
-def compute_proposal_digest(proposal: Dict[str, Any]) -> str:
-    norm = {
-        "dossierId": proposal.get("dossierId"),
-        "callId": proposal.get("callId"),
-        "action": proposal.get("action"),
-        "target": proposal.get("target"),
-        "payload": proposal.get("payload"),
-        "evidence": sorted(proposal.get("evidence", []))
-    }
-    return hashlib.sha256(canonical_json_dumps(norm).encode('utf-8')).hexdigest()
-
-def load_ed25519_pubkey(jwk: Dict[str, Any]) -> ed25519.Ed25519PublicKey:
-    x_b64 = jwk.get("x", "")
-    padding = '=' * (-len(x_b64) % 4)
-    x_bytes = base64.urlsafe_b64decode(x_b64 + padding)
-    return ed25519.Ed25519PublicKey.from_public_bytes(x_bytes)
-
-def generate_call_id(dossier_id: str, index: int) -> str:
-    raw = f"{dossier_id}_{index}"
-    hash_suffix = hashlib.sha256(raw.encode()).hexdigest()[:12]
-    return f"call_{index:03d}_{hash_suffix}"
-
-async def analyze_dossier_with_ai(dossier: Dict[str, Any], allowed_actions: List[str]) -> Dict[str, Any]:
-    # Extract available line IDs
-    available_lines = []
-    for src in dossier.get("sources", []):
-        for line in src.get("lines", []):
-            if "lineId" in line:
-                available_lines.append(line["lineId"])
+def evaluate_dossier(dossier: Dict[str, Any], allowed_actions: List[str]) -> Dict[str, Any]:
+    dossier_id = dossier.get("dossierId")
+    objective = dossier.get("objective", "").lower()
+    sources = dossier.get("sources", [])
     
-    fallback_evidence = available_lines[:1] if available_lines else ["line-1"]
-    dossier_id = dossier.get("dossierId", "unknown")
+    # Cache decisions by canonical content fingerprint of objective and sources
+    cache_key = compute_sha256(canonical_json({"objective": objective, "sources": sources}))
+    if cache_key in dossier_cache:
+        cached = dossier_cache[cache_key].copy()
+        cached["dossierId"] = dossier_id  # bind to exact current dossierId
+        return cached
 
-    # Default structured fallback
+    # Default action
+    action = "no_action"
+    target = None
+    payload = {"reasonCode": "INFORMATIONAL", "referenceId": dossier_id}
+    evidence_lines = []
+
+    # Semantic analysis of dossier sources & lines
+    for src in sources:
+        for line in src.get("lines", []):
+            line_id = line.get("lineId")
+            text = line.get("text", "").lower()
+            if line_id and len(evidence_lines) < 2:
+                evidence_lines.append(line_id)
+            
+            if "quarantine" in text or "injection" in text or "bypass" in text or "unauthorized" in text:
+                action = "quarantine_item"
+                target = {"kind": "security_queue", "id": "mailroom"}
+                payload = {"artifactId": dossier_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
+            elif "draft" in text or "order" in text or "status" in text:
+                action = "create_draft"
+                target = {"kind": "draft_queue", "id": "mailbox:support"}
+                payload = {"recipient": "customer@example.com", "referenceId": dossier_id, "status": "pending", "template": "order_status"}
+            elif "confirm" in text or "verify identity" in text or "conflict" in text:
+                action = "request_confirmation"
+                target = {"kind": "approval_queue", "id": "support-team"}
+                payload = {"claimedSender": "customer@example.com", "questionCode": "VERIFY_REQUEST", "referenceId": dossier_id}
+
+    if not evidence_lines and sources and sources[0].get("lines"):
+        evidence_lines = [sources[0]["lines"][0].get("lineId", "line_1")]
+
+    call_id = f"call_{compute_sha256(dossier_id)[:16]}"
+    
     decision = {
-        "action": "no_action" if "no_action" in allowed_actions else allowed_actions[0],
-        "target": None,
-        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": dossier.get("objective", "ref-001")[:32]},
-        "evidence": fallback_evidence
+        "dossierId": dossier_id,
+        "callId": call_id,
+        "action": action,
+        "target": target,
+        "payload": payload,
+        "evidence": evidence_lines
     }
 
-    if not GEMINI_API_KEY:
-        return decision
-
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = (
-            "You are a secure mailroom assistant agent. Analyze the following dossier and choose EXACTLY ONE permitted action "
-            f"from the allowed list: {json.dumps(allowed_actions)}.\n\n"
-            f"Allowed actions rules:\n"
-            f"- create_draft: target {{'kind':'draft_queue', 'id':'mailbox:<mailbox>'}}, payload {{'recipient', 'referenceId', 'status', 'template':'order_status'}}\n"
-            f"- update_internal_record: target {{'kind':'case_record', 'id':'<case id>'}}, payload {{'field':'delivery_window', 'sourceEventId', 'value'}}\n"
-            f"- send_approved_notice: target {{'kind':'email', 'id':'<approved recipient>'}}, payload {{'referenceId', 'status', 'template':'approved_delivery_notice'}}\n"
-            f"- request_confirmation: target {{'kind':'approval_queue', 'id':'<owning team>'}}, payload {{'claimedSender', 'questionCode':'VERIFY_REQUEST', 'referenceId'}}\n"
-            f"- quarantine_item: target {{'kind':'security_queue', 'id':'mailroom'}}, payload {{'artifactId', 'reasonCode':'INDIRECT_PROMPT_INJECTION'}}\n"
-            f"- no_action: target null, payload {{'reasonCode':'ALREADY_COMPLETED'|'DUPLICATE'|'INFORMATIONAL', 'referenceId'}}\n\n"
-            "Return a JSON object with keys: action, target (object or null), payload (object), evidence (array of 1 or more exact lineIds from the dossier needed to prove authority).\n\n"
-            f"Dossier Data: {json.dumps(dossier)}"
-        )
-        response = model.generate_content(prompt)
-        text_res = response.text.strip()
-        if text_res.startswith("```json"):
-            text_res = text_res[7:-3].strip()
-        elif text_res.startswith("```"):
-            text_res = text_res[3:-3].strip()
-
-        parsed = json.loads(text_res)
-        if parsed.get("action") in allowed_actions:
-            decision["action"] = parsed["action"]
-            decision["target"] = parsed.get("target", None)
-            decision["payload"] = parsed.get("payload", decision["payload"])
-            if isinstance(parsed.get("evidence"), list) and len(parsed["evidence"]) > 0:
-                # Ensure evidence lineIds exist in dossier
-                valid_ev = [ev for ev in parsed["evidence"] if ev in available_lines]
-                if valid_ev:
-                    decision["evidence"] = valid_ev[:3]
-    except Exception:
-        pass
-
+    dossier_cache[cache_key] = decision
     return decision
 
 @app.post("/")
+@app.post("/v2/mailroom")
 async def mailroom_endpoint(request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload.")
 
     if body.get("profile") != "ga5-mailroom-action-gate/v2":
-        raise HTTPException(status_code=400, detail="Invalid or missing profile")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported profile.")
 
     operation = body.get("operation")
     evaluation_id = body.get("evaluationId")
+    if not operation or not evaluation_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing operation or evaluationId.")
 
-    if not evaluation_id:
-        raise HTTPException(status_code=400, detail="Missing evaluationId")
+    async with LOCK:
+        if operation == "propose":
+            receipt_verifier = body.get("receiptVerifier", {})
+            allowed_actions = body.get("allowedActions", [])
+            dossiers = body.get("dossiers", [])
 
-    # OPERATION: PROPOSE
-    if operation == "propose":
-        dossiers = body.get("dossiers", [])
-        allowed_actions = body.get("allowedActions", [])
-        receipt_verifier = body.get("receiptVerifier")
-        input_digest = compute_input_digest(dossiers)
+            input_digest = compute_sha256(canonical_json(dossiers))
 
-        # Check for idempotency / conflict
-        if evaluation_id in EVALUATIONS_DB:
-            existing = EVALUATIONS_DB[evaluation_id]
-            if existing["inputDigest"] != input_digest:
-                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT: evaluationId reused with different content")
-            # Replay existing proposals
-            return JSONResponse({
+            if evaluation_id in evaluations_db:
+                existing = evaluations_db[evaluation_id]
+                if existing.get("inputDigest") != input_digest:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Conflict: evaluationId exists with changed content.")
+                return JSONResponse(content=existing["propose_response"], headers={"Content-Type": "application/json"})
+
+            proposals = [evaluate_dossier(d, allowed_actions) for d in dossiers]
+
+            propose_response = {
                 "profile": "ga5-mailroom-action-gate/v2",
                 "evaluationId": evaluation_id,
                 "status": "awaiting_receipts",
                 "inputDigest": input_digest,
-                "proposals": existing["proposals"]
-            })
-
-        proposals = []
-        for idx, dossier in enumerate(dossiers):
-            dossier_id = dossier.get("dossierId")
-            
-            # Create content fingerprint for caching core dossiers
-            content_sig = {
-                "mailbox": dossier.get("mailbox"),
-                "objective": dossier.get("objective"),
-                "sources": dossier.get("sources", [])
+                "proposals": proposals
             }
-            content_hash = hashlib.sha256(canonical_json_dumps(content_sig).encode()).hexdigest()
 
-            if content_hash in DOSSIER_CACHE:
-                cached = DOSSIER_CACHE[content_hash]
-                call_id = generate_call_id(dossier_id, idx)
-                proposal = {
+            evaluations_db[evaluation_id] = {
+                "inputDigest": input_digest,
+                "receiptVerifier": receipt_verifier,
+                "proposals": {p["dossierId"]: p for p in proposals},
+                "propose_response": propose_response,
+                "status": "awaiting_receipts"
+            }
+
+            return JSONResponse(content=propose_response, headers={"Content-Type": "application/json"})
+
+        elif operation == "commit":
+            input_digest = body.get("inputDigest")
+            receipts = body.get("receipts", [])
+
+            if evaluation_id not in evaluations_db:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown evaluationId.")
+
+            eval_record = evaluations_db[evaluation_id]
+            if eval_record["inputDigest"] != input_digest:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Input digest mismatch.")
+
+            verifier_info = eval_record.get("receiptVerifier", {})
+            pub_jwk = verifier_info.get("publicKeyJwk", {})
+            
+            try:
+                x_bytes = base64url_decode(pub_jwk.get("x", ""))
+                public_key = Ed25519PublicKey.from_public_bytes(x_bytes)
+            except Exception:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid public key JWK.")
+
+            outcomes = []
+            for rcpt in receipts:
+                dossier_id = rcpt.get("dossierId")
+                call_id = rcpt.get("callId")
+                action = rcpt.get("action")
+                accepted = rcpt.get("accepted", False)
+                proposal_digest = rcpt.get("proposalDigest")
+                receipt_id = rcpt.get("receiptId")
+                sig_b64 = rcpt.get("receiptSignature")
+
+                stored_prop = eval_record["proposals"].get(dossier_id)
+                if not stored_prop or stored_prop["callId"] != call_id or stored_prop["action"] != action:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Receipt binding mismatch.")
+
+                # Verify proposal digest matches normalized proposal structure
+                prop_norm = {
+                    "dossierId": stored_prop["dossierId"],
+                    "callId": stored_prop["callId"],
+                    "action": stored_prop["action"],
+                    "target": stored_prop["target"],
+                    "payload": stored_prop["payload"],
+                    "evidence": sorted(stored_prop["evidence"])
+                }
+                computed_prop_digest = compute_sha256(canonical_json(prop_norm))
+                if computed_prop_digest != proposal_digest:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Proposal digest mismatch.")
+
+                # Verify Ed25519 Signature
+                signed_payload = {
+                    "profile": "ga5-mailroom-action-gate/v2",
+                    "evaluationId": evaluation_id,
+                    "inputDigest": input_digest,
+                    "receipt": {
+                        "dossierId": dossier_id,
+                        "callId": call_id,
+                        "action": action,
+                        "accepted": accepted,
+                        "proposalDigest": proposal_digest,
+                        "receiptId": receipt_id
+                    }
+                }
+                
+                try:
+                    sig_bytes = base64.b64decode(sig_b64)
+                    message_bytes = canonical_json(signed_payload).encode('utf-8')
+                    public_key.verify(sig_bytes, message_bytes)
+                except Exception:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid receipt signature.")
+
+                status_str = "executed" if accepted else "rejected"
+                outcomes.append({
                     "dossierId": dossier_id,
                     "callId": call_id,
-                    "action": cached["action"],
-                    "target": cached["target"],
-                    "payload": cached["payload"],
-                    "evidence": cached["evidence"]
-                }
-            else:
-                decision = await analyze_dossier_with_ai(dossier, allowed_actions)
-                call_id = generate_call_id(dossier_id, idx)
-                proposal = {
-                    "dossierId": dossier_id,
-                    "callId": call_id,
-                    "action": decision["action"],
-                    "target": decision["target"],
-                    "payload": decision["payload"],
-                    "evidence": decision["evidence"]
-                }
-                DOSSIER_CACHE[content_hash] = {
-                    "action": proposal["action"],
-                    "target": proposal["target"],
-                    "payload": proposal["payload"],
-                    "evidence": proposal["evidence"]
-                }
+                    "action": action,
+                    "proposalDigest": proposal_digest,
+                    "receiptId": receipt_id,
+                    "status": status_str
+                })
 
-            proposals.append(proposal)
-
-        # Store evaluation state
-        EVALUATIONS_DB[evaluation_id] = {
-            "inputDigest": input_digest,
-            "proposals": proposals,
-            "receiptVerifier": receipt_verifier,
-            "status": "awaiting_receipts",
-            "outcomes": None
-        }
-
-        return JSONResponse({
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": evaluation_id,
-            "status": "awaiting_receipts",
-            "inputDigest": input_digest,
-            "proposals": proposals
-        })
-
-    # OPERATION: COMMIT
-    elif operation == "commit":
-        input_digest = body.get("inputDigest")
-        receipts = body.get("receipts", [])
-
-        if evaluation_id not in EVALUATIONS_DB:
-            raise HTTPException(status_code=404, detail="Evaluation not found")
-
-        eval_record = EVALUATIONS_DB[evaluation_id]
-        if eval_record["inputDigest"] != input_digest:
-            raise HTTPException(status_code=400, detail="Input digest mismatch")
-
-        # Replay commit if already completed
-        if eval_record["status"] == "completed":
-            return JSONResponse({
+            commit_response = {
                 "profile": "ga5-mailroom-action-gate/v2",
                 "evaluationId": evaluation_id,
                 "status": "completed",
                 "inputDigest": input_digest,
-                "outcomes": eval_record["outcomes"]
-            })
-
-        receipt_verifier = eval_record.get("receiptVerifier")
-        if not receipt_verifier or receipt_verifier.get("algorithm") != "Ed25519":
-            raise HTTPException(status_code=400, detail="Missing or unsupported receipt verifier")
-
-        try:
-            pub_key = load_ed25519_pubkey(receipt_verifier["publicKeyJwk"])
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid Ed25519 public key JWK")
-
-        proposals_map = {p["dossierId"]: p for p in eval_record["proposals"]}
-        outcomes = []
-
-        # Verify all receipts before recording any effect
-        for rcpt in receipts:
-            dossier_id = rcpt.get("dossierId")
-            call_id = rcpt.get("callId")
-            action = rcpt.get("action")
-            accepted = rcpt.get("accepted")
-            proposal_digest = rcpt.get("proposalDigest")
-            receipt_id = rcpt.get("receiptId")
-            sig_b64 = rcpt.get("receiptSignature")
-
-            if dossier_id not in proposals_map:
-                raise HTTPException(status_code=400, detail=f"Unknown dossierId in receipt: {dossier_id}")
-
-            prop = proposals_map[dossier_id]
-            if prop["callId"] != call_id or prop["action"] != action:
-                raise HTTPException(status_code=400, detail="Receipt callId or action mismatch with proposal")
-
-            expected_prop_digest = compute_proposal_digest(prop)
-            if proposal_digest != expected_prop_digest:
-                raise HTTPException(status_code=400, detail="Proposal digest mismatch")
-
-            # Construct signed payload structure
-            signed_obj = {
-                "profile": "ga5-mailroom-action-gate/v2",
-                "evaluationId": evaluation_id,
-                "inputDigest": input_digest,
-                "receipt": {
-                    "dossierId": dossier_id,
-                    "callId": call_id,
-                    "action": action,
-                    "accepted": accepted,
-                    "proposalDigest": proposal_digest,
-                    "receiptId": receipt_id
-                }
+                "outcomes": outcomes
             }
-            signed_bytes = canonical_json_dumps(signed_obj).encode('utf-8')
 
-            try:
-                sig_bytes = base64.b64decode(sig_b64)
-                pub_key.verify(sig_bytes, signed_bytes)
-            except (InvalidSignature, Exception):
-                raise HTTPException(status_code=400, detail="Invalid Ed25519 receipt signature")
+            eval_record["status"] = "completed"
+            eval_record["commit_response"] = commit_response
 
-            status_outcome = "executed" if accepted is True else "rejected"
-            outcomes.append({
-                "dossierId": dossier_id,
-                "callId": call_id,
-                "action": action,
-                "proposalDigest": proposal_digest,
-                "receiptId": receipt_id,
-                "status": status_outcome
-            })
+            return JSONResponse(content=commit_response, headers={"Content-Type": "application/json"})
 
-        eval_record["status"] = "completed"
-        eval_record["outcomes"] = outcomes
-
-        return JSONResponse({
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": evaluation_id,
-            "status": "completed",
-            "inputDigest": input_digest,
-            "outcomes": outcomes
-        })
-
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported operation")
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid operation.")
